@@ -1,0 +1,8 @@
+.env
+downloads/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+download_state.json
