@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
+from aiohttp import ClientResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +64,33 @@ class ZLibAPI:
     async def _post(self, path: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._session_required()
         url = f"{self.base_url}{path}"
-        logger.debug("POST %s", url)
-        async with session.post(url, data=data or {}) as resp:
-            resp.raise_for_status()
-            result = await resp.json(content_type=None)
-            if not isinstance(result, dict):
-                raise ZLibAPIError(f"Unexpected response from {path}")
-            return result
+        last_exc: Exception | None = None
+
+        for attempt in range(3):
+            logger.debug("POST %s (attempt %d)", url, attempt + 1)
+            try:
+                async with session.post(url, data=data or {}) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json(content_type=None)
+                    if not isinstance(result, dict):
+                        raise ZLibAPIError(f"Unexpected response from {path}")
+                    return result
+            except ClientResponseError as exc:
+                last_exc = exc
+                if exc.status >= 500 and attempt < 2:
+                    wait = 2 ** attempt
+                    logger.warning("API %s 返回 %s，%ds 后重试", path, exc.status, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+            except aiohttp.ClientError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
+
+        raise ZLibAPIError(f"请求失败: {last_exc}")
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._session_required()

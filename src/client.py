@@ -14,6 +14,10 @@ from .zlib_api import ZLibAPI, ZLibAPIError
 
 logger = logging.getLogger(__name__)
 
+# macOS 单文件名上限 255 字节，留余量给扩展名
+MAX_FILENAME_LEN = 180
+MIN_MATCH_SCORE = 75
+
 
 @dataclass
 class DownloadResult:
@@ -26,7 +30,26 @@ class DownloadResult:
 def _sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = re.sub(r"\s+", " ", name).strip()
-    return name[:200] or "unknown"
+    return name or "unknown"
+
+
+def _truncate_filename(filename: str, max_len: int = MAX_FILENAME_LEN) -> str:
+    """按字符截断，避免超出文件系统限制。"""
+    if len(filename) <= max_len:
+        return filename
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        return filename[:max_len]
+    room = max_len - len(ext) - 1
+    if room < 10:
+        return filename[:max_len]
+    return f"{stem[:room]}.{ext}"
+
+
+def _first_author(author: str) -> str:
+    if not author:
+        return ""
+    return re.split(r"[,、;/]", author)[0].strip()
 
 
 def _normalize_match_text(text: str) -> str:
@@ -99,26 +122,56 @@ def find_local_file(entry: BookEntry, download_dir: Path) -> Path | None:
     return min(matches, key=lambda p: len(p.name))
 
 
+def _title_score(entry_title: str, book_title: str) -> float:
+    et = _normalize_match_text(entry_title)
+    bt = _normalize_match_text(book_title)
+    if not et:
+        return 0.0
+    if et == bt:
+        return 100.0
+    if et in bt or bt in et:
+        return 80.0
+    # 中文书名：前缀匹配
+    if any("\u4e00" <= c <= "\u9fff" for c in et):
+        probe = et[: min(len(et), 12)]
+        if len(probe) >= 2 and probe in bt:
+            return 75.0
+    words = [w for w in et.split() if len(w) >= 3]
+    if not words:
+        return 50.0 if et in bt else 0.0
+    matched = sum(1 for w in words if w in bt)
+    ratio = matched / len(words)
+    if ratio >= 0.5:
+        return 70.0 * ratio
+    return 0.0
+
+
+def _author_score(entry_author: str, book_author: str) -> float:
+    author_text = book_author.lower()
+    for part in re.split(r"[,、/]", entry_author):
+        part = part.strip().lower()
+        if not part or len(part) <= 2:
+            continue
+        if part in author_text:
+            return 40.0
+        for word in part.split():
+            if len(word) >= 3 and word in author_text:
+                return 35.0
+    return 0.0
+
+
 def _score_match(entry: BookEntry, book: dict[str, Any]) -> float:
-    score = 0.0
-    book_title = (book.get("title") or book.get("name") or "").lower()
-    author_text = (book.get("author") or "").lower()
+    book_title = book.get("title") or book.get("name") or ""
+    book_author = book.get("author") or ""
 
-    if entry.title:
-        title_lower = entry.title.lower()
-        if title_lower == book_title:
-            score += 100
-        elif title_lower in book_title or book_title in title_lower:
-            score += 60
+    title_pts = _title_score(entry.title, book_title) if entry.title else 0.0
+    author_pts = _author_score(entry.author, book_author) if entry.author else 0.0
 
-    if entry.author:
-        author_lower = entry.author.lower()
-        # 支持多作者分隔符
-        for part in re.split(r"[,、/]", author_lower):
-            part = part.strip()
-            if part and part in author_text:
-                score += 40
-                break
+    # 有书名时，作者分仅在书名有一定匹配时才计入（避免仅作者同名误匹配）
+    if entry.title and title_pts < 30:
+        author_pts = 0.0
+
+    score = title_pts + author_pts
 
     ext = (book.get("extension") or "").upper()
     if entry.extension and ext == entry.extension.upper().lstrip("."):
@@ -130,6 +183,16 @@ def _score_match(entry: BookEntry, book: dict[str, Any]) -> float:
         pass
 
     return score
+
+
+def _is_acceptable_match(entry: BookEntry, book: dict[str, Any], score: float) -> bool:
+    if score < MIN_MATCH_SCORE:
+        return False
+    if entry.title:
+        title_pts = _title_score(entry.title, book.get("title") or book.get("name") or "")
+        if title_pts < 30:
+            return False
+    return True
 
 
 class ZLibClient:
@@ -163,39 +226,101 @@ class ZLibClient:
     async def close(self) -> None:
         await self.api.close()
 
+    async def _search_books(self, entry: BookEntry) -> list[dict[str, Any]]:
+        """尝试多种搜索词，合并去重结果。"""
+        extension = entry.extension or ""
+        queries: list[str] = []
+        if entry.search_query:
+            queries.append(entry.search_query)
+        if entry.title and entry.title not in queries:
+            queries.append(entry.title)
+
+        seen_ids: set[str] = set()
+        results: list[dict[str, Any]] = []
+
+        for query in queries:
+            books: list[dict[str, Any]] = []
+            try:
+                books = await self.api.search(query, extension=extension, limit=25)
+            except Exception as exc:
+                logger.warning("搜索 '%s' 失败: %s", query, exc)
+                if entry.title and query != entry.title:
+                    try:
+                        books = await self.api.search(entry.title, extension=extension, limit=25)
+                    except Exception as exc2:
+                        logger.warning("书名搜索 '%s' 也失败: %s", entry.title, exc2)
+                        continue
+                else:
+                    continue
+
+            if not books and extension:
+                try:
+                    books = await self.api.search(query, limit=25)
+                except Exception:
+                    continue
+
+            for book in books:
+                bid = str(book.get("id", ""))
+                if bid and bid not in seen_ids:
+                    seen_ids.add(bid)
+                    results.append(book)
+
+        return results
+
     async def _find_best_match(self, entry: BookEntry) -> dict[str, Any] | None:
         if entry.book_id:
             book = await self.api.get_book_by_id(entry.book_id)
             return book
 
-        query = entry.search_query
-        if not query:
+        if not entry.search_query and not entry.title:
             return None
 
-        extension = entry.extension or ""
-        books = await self.api.search(query, extension=extension, limit=25)
-        if not books and extension:
-            books = await self.api.search(query, limit=25)
-
+        books = await self._search_books(entry)
         if not books:
             return None
 
-        return max(books, key=lambda b: _score_match(entry, b))
+        ranked = sorted(
+            ((b, _score_match(entry, b)) for b in books),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        best_book, best_score = ranked[0]
+        if not _is_acceptable_match(entry, best_book, best_score):
+            logger.warning(
+                "最佳匹配置信度不足 (score=%.0f): 期望 [%s] -> 命中 [%s]",
+                best_score,
+                entry.display_name,
+                best_book.get("title"),
+            )
+            return None
 
-    def _build_filepath(self, book: dict[str, Any], file_info: dict[str, Any] | None = None) -> Path:
-        if file_info and file_info.get("description"):
-            name = file_info["description"]
-            author = file_info.get("author") or book.get("author") or ""
-            ext = (file_info.get("extension") or book.get("extension") or "bin").lower().lstrip(".")
-        else:
-            name = book.get("title") or "unknown"
-            author = book.get("author") or ""
-            ext = (book.get("extension") or "bin").lower().lstrip(".")
+        return best_book
+
+    def _build_filepath(
+        self,
+        entry: BookEntry,
+        book: dict[str, Any],
+        file_info: dict[str, Any] | None = None,
+    ) -> Path:
+        ext = (
+            (file_info or {}).get("extension")
+            or book.get("extension")
+            or entry.extension
+            or "bin"
+        )
+        ext = str(ext).lower().lstrip(".")
+
+        # 优先用书目录中的短书名/作者，避免 API 元数据过长
+        name = entry.title or (file_info or {}).get("description") or book.get("title") or "unknown"
+        author = entry.author or _first_author((file_info or {}).get("author") or book.get("author") or "")
+
+        name = _sanitize_filename(name)[:80]
+        author = _sanitize_filename(_first_author(author))[:40]
 
         if author:
-            filename = f"{_sanitize_filename(name)} - {_sanitize_filename(author)}.{ext}"
+            filename = _truncate_filename(f"{name} - {author}.{ext}")
         else:
-            filename = f"{_sanitize_filename(name)}.{ext}"
+            filename = _truncate_filename(f"{name}.{ext}")
 
         return self.download_dir / filename
 
@@ -229,7 +354,7 @@ class ZLibClient:
                 )
 
             file_info = await self.api.get_download_info(book_id, book_hash)
-            filepath = self._build_filepath(book, file_info)
+            filepath = self._build_filepath(entry, book, file_info)
 
             if skip_existing and filepath.exists() and filepath.stat().st_size > 0:
                 return DownloadResult(
